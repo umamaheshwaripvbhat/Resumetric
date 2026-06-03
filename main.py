@@ -48,13 +48,27 @@ except ImportError:
 models.Base.metadata.create_all(bind=engine)
 
 def ensure_database_schema():
-    """Add columns that older local SQLite databases may be missing."""
+    """Add columns that may be missing — works with both SQLite and PostgreSQL."""
+    db_url = str(engine.url)
+    is_postgres = db_url.startswith("postgresql")
+
     with engine.begin() as conn:
-        user_columns = {
-            row[1]
-            for row in conn.exec_driver_sql("PRAGMA table_info(users)").fetchall()
-        }
-        column_defs = {
+        if is_postgres:
+            # PostgreSQL: use information_schema
+            def get_columns(table):
+                result = conn.execute(text(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = :t"
+                ), {"t": table})
+                return {row[0] for row in result.fetchall()}
+        else:
+            # SQLite: use PRAGMA
+            def get_columns(table):
+                result = conn.exec_driver_sql(f"PRAGMA table_info({table})")
+                return {row[1] for row in result.fetchall()}
+
+        # --- Users table ---
+        user_columns = get_columns("users")
+        user_defs = {
             "username": "VARCHAR",
             "profile_photo": "TEXT",
             "college": "VARCHAR",
@@ -73,18 +87,20 @@ def ensure_database_schema():
             "mock_count": "INTEGER DEFAULT 0",
             "followers_count": "INTEGER DEFAULT 0",
             "following_count": "INTEGER DEFAULT 0",
-            "is_verified": "BOOLEAN DEFAULT 0",
-            "notifications_enabled": "BOOLEAN DEFAULT 1",
-            "is_private": "BOOLEAN DEFAULT 0",
-            "is_active": "BOOLEAN DEFAULT 1",
+            "is_verified": "BOOLEAN DEFAULT FALSE",
+            "notifications_enabled": "BOOLEAN DEFAULT TRUE",
+            "is_private": "BOOLEAN DEFAULT FALSE",
+            "is_active": "BOOLEAN DEFAULT TRUE",
         }
-        for column, definition in column_defs.items():
+        for column, definition in user_defs.items():
             if column not in user_columns:
-                conn.execute(text(f"ALTER TABLE users ADD COLUMN {column} {definition}"))
-        post_columns = {
-            row[1]
-            for row in conn.exec_driver_sql("PRAGMA table_info(posts)").fetchall()
-        }
+                try:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {column} {definition}"))
+                except Exception:
+                    pass  # Column already exists or incompatible type — safe to skip
+
+        # --- Posts table ---
+        post_columns = get_columns("posts")
         post_defs = {
             "post_type": "VARCHAR DEFAULT 'Interview Question'",
             "role_tag": "VARCHAR",
@@ -100,9 +116,17 @@ def ensure_database_schema():
         }
         for column, definition in post_defs.items():
             if column not in post_columns:
-                conn.execute(text(f"ALTER TABLE posts ADD COLUMN {column} {definition}"))
+                try:
+                    conn.execute(text(f"ALTER TABLE posts ADD COLUMN {column} {definition}"))
+                except Exception:
+                    pass  # Column already exists — safe to skip
 
-ensure_database_schema()
+try:
+    ensure_database_schema()
+except Exception as e:
+    # Don't crash the whole server if schema migration fails
+    print(f"[WARNING] Schema migration skipped: {e}")
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
